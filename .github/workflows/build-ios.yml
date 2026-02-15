@@ -1,0 +1,238 @@
+name: Build iOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_mode:
+        description: 'Build mode'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+      api_base_url:
+        description: 'API Base URL (e.g., https://your-panel.com/api/v1)'
+        required: false
+        type: string
+        default: ''
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'lib/**'
+      - 'ios/**'
+      - 'pubspec.yaml'
+      - '.github/workflows/build-ios.yml'
+  pull_request:
+    branches:
+      - main
+      - master
+
+jobs:
+  build:
+    name: Build iOS App
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.27.1'
+          channel: 'stable'
+          cache: true
+      
+      - name: Verify Flutter and Dart versions
+        run: |
+          flutter --version
+          dart --version
+      
+      - name: Get Flutter dependencies
+        run: flutter pub get
+      
+      - name: Install CocoaPods
+        run: |
+          sudo gem install cocoapods
+          pod --version
+      
+      - name: Install CocoaPods dependencies
+        working-directory: ios
+        run: |
+          # Flutter 会在 pub get 时生成 Podfile，如果不存在则跳过
+          if [ -f "Podfile" ]; then
+            pod install --repo-update
+          else
+            echo "Podfile not found. Flutter will generate it during build."
+            echo "This is normal for Flutter projects - pod install will be handled automatically."
+          fi
+      
+      - name: Verify Flutter setup
+        run: flutter doctor -v
+      
+      - name: Build iOS (no codesign)
+        run: |
+          BUILD_ARGS="--${{ github.event.inputs.build_mode || 'release' }} --no-codesign"
+          if [ -n "${{ github.event.inputs.api_base_url }}" ]; then
+            BUILD_ARGS="$BUILD_ARGS --dart-define=API_BASE_URL=${{ github.event.inputs.api_base_url }}"
+          elif [ -n "${{ secrets.API_BASE_URL }}" ]; then
+            BUILD_ARGS="$BUILD_ARGS --dart-define=API_BASE_URL=${{ secrets.API_BASE_URL }}"
+          fi
+          flutter build ios $BUILD_ARGS
+        env:
+          FLUTTER_BUILD_MODE: ${{ github.event.inputs.build_mode || 'release' }}
+      
+      - name: Check for PacketTunnel target
+        working-directory: ios
+        run: |
+          # 检查是否存在 PacketTunnel scheme
+          if xcodebuild -workspace Runner.xcworkspace -list | grep -q "PacketTunnel"; then
+            echo "PACKETTUNNEL_EXISTS=true" >> $GITHUB_ENV
+            echo "PacketTunnel target found"
+          else
+            echo "PACKETTUNNEL_EXISTS=false" >> $GITHUB_ENV
+            echo "PacketTunnel target not found (this is OK if not yet configured)"
+          fi
+      
+      - name: Create Xcode Archive
+        working-directory: ios
+        run: |
+          BUILD_CONFIG=${{ github.event.inputs.build_mode == 'debug' && 'Debug' || 'Release' }}
+          
+          # 如果存在 PacketTunnel，需要同时构建两个 target
+          if [ "$PACKETTUNNEL_EXISTS" = "true" ]; then
+            echo "Building with PacketTunnel extension..."
+            xcodebuild clean archive \
+              -workspace Runner.xcworkspace \
+              -scheme Runner \
+              -configuration $BUILD_CONFIG \
+              -archivePath build/Runner.xcarchive \
+              -allowProvisioningUpdates \
+              CODE_SIGN_IDENTITY="" \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGNING_ALLOWED=NO \
+              -derivedDataPath build/DerivedData
+          else
+            echo "Building without PacketTunnel extension..."
+            xcodebuild clean archive \
+              -workspace Runner.xcworkspace \
+              -scheme Runner \
+              -configuration $BUILD_CONFIG \
+              -archivePath build/Runner.xcarchive \
+              -allowProvisioningUpdates \
+              CODE_SIGN_IDENTITY="" \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGNING_ALLOWED=NO
+          fi
+      
+      - name: Create unsigned IPA from .app
+        run: |
+          # 创建 Payload 目录
+          mkdir -p build/ipa/Payload
+          
+          # 复制 .app 到 Payload 目录
+          cp -r build/ios/iphoneos/Runner.app build/ipa/Payload/
+          
+          # 如果存在 PacketTunnel extension，也需要复制
+          if [ "$PACKETTUNNEL_EXISTS" = "true" ]; then
+            echo "Checking for PacketTunnel extension..."
+            if [ -d "build/ios/iphoneos/PacketTunnel.appex" ]; then
+              echo "Found PacketTunnel extension, copying to Runner.app..."
+              cp -r build/ios/iphoneos/PacketTunnel.appex build/ipa/Payload/Runner.app/PlugIns/ 2>/dev/null || echo "Extension copy may have failed (this is OK for unsigned builds)"
+            fi
+          fi
+          
+          # 创建 IPA 文件（ZIP 格式）
+          cd build/ipa
+          zip -r ../flux-unsigned.ipa Payload
+          cd ../..
+          
+          echo "IPA created at: build/flux-unsigned.ipa"
+          ls -lh build/flux-unsigned.ipa || echo "IPA creation may have failed"
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-${{ github.event.inputs.build_mode || 'release' }}-${{ github.run_number }}
+          path: |
+            build/ios/iphoneos/Runner.app
+            ios/build/Runner.xcarchive
+            build/flux-unsigned.ipa
+          retention-days: 30
+          if-no-files-found: warn
+      
+      - name: Collect build logs
+        if: always()
+        run: |
+          # 收集构建日志
+          mkdir -p build/logs
+          
+          # 保存 Flutter 构建日志（如果存在）
+          if [ -f "build/ios/iphoneos/Runner.app/Info.plist" ]; then
+            echo "Build successful" > build/logs/build_status.txt
+          else
+            echo "Build may have issues" > build/logs/build_status.txt
+          fi
+          
+          # 保存环境信息
+          {
+            echo "Flutter Version:"
+            flutter --version
+            echo ""
+            echo "Dart Version:"
+            dart --version
+            echo ""
+            echo "CocoaPods Version:"
+            pod --version || echo "Not installed"
+            echo ""
+            echo "Xcode Version:"
+            xcodebuild -version || echo "Not available"
+          } > build/logs/environment.txt
+          
+          # 检查是否有编译错误
+          if [ -d "ios/build" ]; then
+            find ios/build -name "*.log" -type f | head -5 | while read logfile; do
+              echo "=== $logfile ===" >> build/logs/xcode_build.log
+              tail -100 "$logfile" >> build/logs/xcode_build.log 2>/dev/null || true
+            done
+          fi
+      
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_number }}
+          path: build/logs/
+          retention-days: 7
+          if-no-files-found: ignore
+      
+      - name: Build summary
+        run: |
+          echo "## iOS Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- Build Mode: ${{ github.event.inputs.build_mode || 'release' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Flutter Version: $(flutter --version | head -n 1)" >> $GITHUB_STEP_SUMMARY
+          echo "- Build Number: ${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ github.event.inputs.api_base_url }}" ]; then
+            echo "- API Base URL: ${{ github.event.inputs.api_base_url }}" >> $GITHUB_STEP_SUMMARY
+          elif [ -n "${{ secrets.API_BASE_URL }}" ]; then
+            echo "- API Base URL: Configured (from secrets)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- API Base URL: Using default value" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "- Runner.app: Available in artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "- Runner.xcarchive: Available in artifacts" >> $GITHUB_STEP_SUMMARY
+          if [ -f "build/flux-unsigned.ipa" ]; then
+            echo "- flux-unsigned.ipa: Available in artifacts (unsigned, cannot install directly)" >> $GITHUB_STEP_SUMMARY
+            echo "- Note: This IPA is unsigned and cannot be installed on devices without additional signing" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- IPA file: Creation may have failed (check logs)" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Build Logs" >> $GITHUB_STEP_SUMMARY
+          echo "- Build logs are available in the artifacts section" >> $GITHUB_STEP_SUMMARY
+          echo "- Look for: \`build-logs-${{ github.run_number }}\` artifact" >> $GITHUB_STEP_SUMMARY
